@@ -9,18 +9,26 @@ module Kinesis.Coordination where
 -------------------------------------------------------------------------------
 import           Aws.Kinesis
 import           Control.Arrow
+import           Control.Concurrent           (threadDelay)
+import           Control.Concurrent.Async
+import           Control.Concurrent.MVar
 import           Control.Error
-import           Control.Lens                hiding (assign)
+import           Control.Exception.Base       (evaluate)
+import           Control.Lens                 hiding (assign)
 import           Control.Monad
 import           Control.Monad.Catch
 import           Control.Monad.Reader
-
+import           Control.Monad.State.Strict
 import           Control.Monad.Trans.Control
+import           Control.Monad.Trans.Resource
+import           Data.Conduit
 import           Data.List
-import           Data.Map.Strict             (Map)
-import qualified Data.Map.Strict             as M
+import           Data.Map.Strict              (Map)
+import qualified Data.Map.Strict              as M
 import           Data.Ord
-import qualified Data.Set                    as S
+import           Data.RNG
+import qualified Data.Set                     as S
+import           Data.String.Conv
 import           Data.Time
 -------------------------------------------------------------------------------
 import           Kinesis.Kinesis
@@ -29,15 +37,122 @@ import           Kinesis.Types
 -------------------------------------------------------------------------------
 
 
+-------------------------------------------------------------------------------
+-- | The single-threaded master control loop.
+masterLoop
+    :: (MonadIO m, MonadReader AppEnv m, MonadState NodeState m,
+        MonadCatch m, MonadBaseControl IO m)
+    => Sink Record (ResourceT (ReaderT AppEnv IO)) ()
+    -> EitherT String m b
+masterLoop f = do
+    introduceNode
+
+    forever $ do
+      implementAssignments f
+      checkpointNode
+      liftIO $ threadDelay 30000000
+
 
 -------------------------------------------------------------------------------
--- | Checkpoint node state.
-checkpointNode ns = undefined
+-- | Look into workers managed by this node and checkpoint their
+-- status to central database.
+checkpointNode
+    :: (Functor m, MonadIO m, MonadReader AppEnv m,
+        MonadState NodeState m)
+    => EitherT String m ()
+checkpointNode = do
+    ws <- use $ nsWorkers . to M.toList
+    forM_ ws $ \ (_sid, (mv, _a)) ->
+      syncShardState =<< liftIO (readMVar mv)
 
 
 -------------------------------------------------------------------------------
 -- | Initialize self as a new node in the cluster.
-introduceNode = undefined
+introduceNode
+    :: (MonadIO m, MonadReader AppEnv m, MonadCatch m,
+        MonadBaseControl IO m)
+    => EitherT String m ()
+introduceNode = do
+    mkNode >>= setNode
+    balanceCluster
+
+
+-------------------------------------------------------------------------------
+mkNode :: (MonadIO m, MonadReader AppEnv m) => m Node
+mkNode = do
+    ip <- view appIp
+    nid <- view appNodeId
+    now <- liftIO getCurrentTime
+    return $ Node nid ip now now
+
+
+-------------------------------------------------------------------------------
+-- | Query for assignments from Redis and implement this node's
+-- responsibility by forking off worker processes.
+implementAssignments
+    :: (Functor m, MonadIO m, MonadReader AppEnv m,
+        MonadState NodeState m)
+    => Sink Record (ResourceT (ReaderT AppEnv IO)) ()
+    -> EitherT String m ()
+implementAssignments work = do
+    nid <- view appNodeId
+
+    allStates <- getAllShardStates
+    let m = collectAssignments allStates
+
+    states <- hoistEither $ note "Node has no assignment" $ M.lookup nid m
+    let sids = map _shardId states
+
+    current <- use nsWorkers
+
+    let isOld k _ = not $ k `elem` sids
+
+        isNew s = isNothing $ M.lookup (_shardId s) current
+
+        kills = M.toList $ M.filterWithKey isOld current
+
+        news = filter isNew states
+
+
+    -- kill cancelled assignments
+    forM_ kills $ \ (sid, (_w, a)) -> do
+      liftIO $ cancel a
+      nsWorkers . at sid .= Nothing
+
+
+    -- implement new workers
+    ae <- ask
+    forM_ news $ \ s -> do
+      wid <- mkWorkerId
+      now <- liftIO getCurrentTime
+      grace <- view $ appConfig . configGraceDelay
+
+      when (diffUTCTime now (s ^. shardAssigned) > grace) $ do
+        let sid = s ^. shardId
+        w <- liftIO $ newMVar (Worker wid sid now Nothing 0)
+        a <- liftIO $ async (runReaderT (runWorker sid w work) ae)
+        nsWorkers . at sid .= Just (w, a)
+
+
+-------------------------------------------------------------------------------
+mkWorkerId :: MonadIO m => m WorkerId
+mkWorkerId = liftIO $ liftM (WorkerId . toS) $ mkRNG >>= randomToken 32
+
+
+-------------------------------------------------------------------------------
+runWorker
+    :: (MonadIO m, MonadReader AppEnv m, MonadCatch m, MonadBaseControl IO m)
+    => ShardId
+    -> MVar Worker
+    -> Sink Record (ResourceT m) a
+    -> m a
+runWorker sid mw f = runResourceT $ streamRecords sid =$= updateWorker $$ f
+    where
+      updateWorker = awaitForever $ \ record -> do
+        yield record
+        liftIO $ modifyMVar_ mw $ \ w -> evaluate $ w
+          & workerLastProcessed .~ Just (recordSequenceNumber record)
+          & workerItems %~ (+1)
 
 
 
@@ -57,6 +172,20 @@ syncShardState w = do
 
 
 -------------------------------------------------------------------------------
+-- | Build index of shard states by node id.
+collectAssignments
+    :: Traversable t
+    => t ShardState
+    -> Map NodeId [ShardState]
+collectAssignments states = collect _shardNode return (++) states
+
+
+-------------------------------------------------------------------------------
+buildStateIx :: [ShardState] -> Map ShardId ShardState
+buildStateIx states = M.fromList $ map (_shardId &&& id) states
+
+
+-------------------------------------------------------------------------------
 -- | Do a complete pass over shards and node information.
 balanceCluster
     :: (MonadIO m, MonadReader AppEnv m, MonadCatch m, MonadBaseControl IO m)
@@ -67,16 +196,19 @@ balanceCluster = do
     states <- getAllShardStates
 
     now <- liftIO $ getCurrentTime
+    nodeDeadGrace <- view $ appConfig . configNodeBeat
 
-    let (deadNodes, aliveNodes) = partition (isDeadNode now) nodes
+    let isDeadNode n = diffUTCTime now (n ^. nodeLastBeat) < nodeDeadGrace
 
-        curAssignment = collect _shardNode (return . _shardId) (++) states
+        (deadNodes, aliveNodes) = partition isDeadNode nodes
+
+        curAssignment = M.map (map _shardId) $ collectAssignments states
 
         newAssignment = assign (map _nodeId aliveNodes) (map shardShardId shards) curAssignment
 
         newAssignment' = invertMap newAssignment
 
-        oldStateIx = M.fromList $ map (_shardId &&& id) states
+        oldStateIx = buildStateIx states
 
 
     -- remove nodes that have disappeared
@@ -92,17 +224,13 @@ balanceCluster = do
     -- update shard assignments on database
     forM_ (M.toList newAssignment') $ \ (sid, nid) -> case M.lookup sid oldStateIx of
       Just ss -> setShardState (ss & shardNode .~ nid)
-      Nothing -> setShardState (ShardState sid nid Nothing now 0)
-
-
--------------------------------------------------------------------------------
--- | Assess if a node is dead
-isDeadNode :: UTCTime -> Node -> Bool
-isDeadNode now n = diffUTCTime now (n ^. nodeLastBeat) < 120
+      Nothing -> setShardState (ShardState sid nid Nothing now now 0)
 
 
 
 -------------------------------------------------------------------------------
+-- | Assign a bunch of bs to as evenly, while minimally disturbing
+-- their apriori assignment.
 assign :: (Eq a, Eq b, Ord a, Ord b) => [a] -> [b] -> Map a [b] -> Map a [b]
 assign as bs cur = new
     where

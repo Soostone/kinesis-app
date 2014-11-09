@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts          #-}
 {-# LANGUAGE MultiParamTypeClasses     #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
+{-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE TypeFamilies              #-}
 
@@ -23,7 +24,7 @@ import           Control.Retry
 import           Data.Conduit
 import qualified Data.Conduit.List            as C
 import           Data.Default
-
+import           Data.String.Conv
 import           Network.HTTP.Conduit
 -------------------------------------------------------------------------------
 import           Kinesis.Types
@@ -42,6 +43,20 @@ getAllShards = bimapEitherT show id $ do
     nm <- EitherT $ streamName <$> view (appName . unAppName)
     let ds = DescribeStream Nothing Nothing nm
     runResourceT (awsIteratedList' (runKinesis 10) ds $$ C.take 1000)
+
+
+-------------------------------------------------------------------------------
+-- | Produce an infinite stream of records from shard.
+streamRecords
+    :: (Functor n, MonadIO n, MonadReader AppEnv n, MonadCatch n)
+    => ShardId
+    -> Producer (ResourceT n) Record
+streamRecords sid = do
+    nm <- either (error.toS) id . streamName <$> view (appName . unAppName)
+    let gsi = GetShardIterator sid AtSequenceNumber Nothing nm
+    iter <- lift $ getShardIteratorResShardIterator <$> runKinesis 10 gsi
+    let gr = GetRecords Nothing iter
+    awsIteratedList' (runKinesis 10) gr
 
 
 
