@@ -130,7 +130,7 @@ implementAssignments work = do
       when (diffUTCTime now (s ^. shardAssigned) > grace) $ do
         let sid = s ^. shardId
         w <- liftIO $ newMVar (Worker wid sid now Nothing 0)
-        a <- liftIO $ async (runReaderT (runWorker sid w work) ae)
+        a <- liftIO $ async (runReaderT (runWorker s w work) ae)
         nsWorkers . at sid .= Just (w, a)
 
 
@@ -142,12 +142,15 @@ mkWorkerId = liftIO $ liftM (WorkerId . toS) $ mkRNG >>= randomToken 32
 -------------------------------------------------------------------------------
 runWorker
     :: (MonadIO m, MonadReader AppEnv m, MonadCatch m, MonadBaseControl IO m)
-    => ShardId
+    => ShardState
     -> MVar Worker
     -> Sink Record (ResourceT m) a
     -> m a
-runWorker sid mw f = runResourceT $ streamRecords sid =$= updateWorker $$ f
+runWorker s mw f = runResourceT $ streamRecords sid sn =$= updateWorker $$ f
     where
+      sid = s ^. shardId
+      sn = s ^. shardSeq
+
       updateWorker = awaitForever $ \ record -> do
         yield record
         liftIO $ modifyMVar_ mw $ \ w -> evaluate $ w

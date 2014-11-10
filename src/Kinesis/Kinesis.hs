@@ -50,10 +50,11 @@ getAllShards = bimapEitherT show id $ do
 streamRecords
     :: (Functor n, MonadIO n, MonadReader AppEnv n, MonadCatch n)
     => ShardId
+    -> Maybe SequenceNumber
     -> Producer (ResourceT n) Record
-streamRecords sid = do
+streamRecords sid sn = do
     nm <- either (error.toS) id . streamName <$> view (appName . unAppName)
-    let gsi = GetShardIterator sid AtSequenceNumber Nothing nm
+    let gsi = GetShardIterator sid AfterSequenceNumber sn nm
     iter <- lift $ getShardIteratorResShardIterator <$> runKinesis 10 gsi
     let gr = GetRecords Nothing iter
     awsIteratedList' (runKinesis 10) gr
