@@ -12,8 +12,10 @@ import           Control.Lens
 import           Data.Aeson
 import           Data.Aeson.TH
 import           Data.Char
+import           Data.Default
 import           Data.Int
 import           Data.Map.Strict          (Map)
+import qualified Data.Map.Strict          as M
 import           Data.Text                (Text)
 import           Data.Time
 import qualified Database.Redis           as R
@@ -39,6 +41,7 @@ newtype NodeId = NodeId { _unNodeId :: Text }
 -------------------------------------------------------------------------------
 data AppEnv = AppEnv {
       _appName      :: AppName
+    , _appStream    :: Text
     , _appRedis     :: R.Connection
     , _appManager   :: Manager
     , _appAwsConfig :: Aws.Configuration
@@ -65,6 +68,8 @@ data NodeState = NodeState {
       _nsWorkers :: ! (Map ShardId (MVar Worker, Async ()))
     }
 
+instance Default NodeState where
+    def = NodeState M.empty
 
 -------------------------------------------------------------------------------
 -- | Last state for each known shard in cluster.
@@ -101,6 +106,16 @@ data Worker = Worker {
     } deriving (Eq,Show,Read,Ord)
 
 
+data ClusterState = ClusterState {
+      _clusterShards         :: [Shard]
+    , _clusterShardStates    :: [ShardState]
+    , _clusterDeadNodes      :: [Node]
+    , _clusterAliveNodes     :: [Node]
+    , _clusterAssignments    :: Map ShardId NodeId
+    , _clusterNewAssignments :: Map ShardId NodeId
+    , _clusterNeedsRebalance :: Bool
+    } deriving (Eq,Show,Read,Ord)
+
 
 -------------------------------------------------------------------------------
 makeLenses ''WorkerId
@@ -112,6 +127,7 @@ makeLenses ''AppEnv
 makeLenses ''AppConfig
 makeLenses ''NodeState
 makeLenses ''ShardState
+makeLenses ''ClusterState
 -------------------------------------------------------------------------------
 
 

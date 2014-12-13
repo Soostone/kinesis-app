@@ -3,6 +3,8 @@
 {-# LANGUAGE MultiParamTypeClasses     #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE OverloadedStrings         #-}
+{-# LANGUAGE RankNTypes                #-}
+{-# LANGUAGE RecordWildCards           #-}
 
 module Kinesis.Coordination where
 
@@ -12,6 +14,7 @@ import           Control.Arrow
 import           Control.Concurrent           (threadDelay)
 import           Control.Concurrent.Async
 import           Control.Concurrent.MVar
+import           Control.Concurrent.STM
 import           Control.Error
 import           Control.Exception.Base       (evaluate)
 import           Control.Lens                 hiding (assign)
@@ -22,9 +25,12 @@ import           Control.Monad.State.Strict
 import           Control.Monad.Trans.Control
 import           Control.Monad.Trans.Resource
 import           Data.Conduit
+import qualified Data.Conduit.List            as C
+import           Data.Default
 import           Data.List
 import           Data.Map.Strict              (Map)
 import qualified Data.Map.Strict              as M
+import           Data.Monoid
 import           Data.Ord
 import           Data.RNG
 import qualified Data.Set                     as S
@@ -37,19 +43,46 @@ import           Kinesis.Types
 -------------------------------------------------------------------------------
 
 
+-- | Processors get fed records and they work their magic.
+type Processor  = Maybe Record -> IO ()
+
+
+-------------------------------------------------------------------------------
+-- | Turn a sink into a processor
+processorSink
+    :: MonadIO n
+    => Sink Record n ()
+    -> (forall a. n a -> IO a)
+    -> IO (Maybe Record -> IO ())
+processorSink f run = do
+    ch <- atomically $ newTBQueue 1024
+    let go = do
+            a <- liftIO $ atomically $ readTBQueue ch
+            case a of
+              Nothing -> return ()
+              Just a' -> yield a' >> go
+
+    async (run $ go $$ f) >>= link
+    return $ \ a -> atomically (writeTBQueue ch a)
+
+
+
+
 -------------------------------------------------------------------------------
 -- | The single-threaded master control loop.
 masterLoop
-    :: (MonadIO m, MonadReader AppEnv m, MonadState NodeState m,
-        MonadCatch m, MonadBaseControl IO m)
-    => Sink Record (ResourceT (ReaderT AppEnv IO)) ()
-    -> EitherT String m b
-masterLoop f = do
+    :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+    => AppEnv
+    -> Processor
+    -> m (Either String ())
+masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
     introduceNode
 
     forever $ do
-      implementAssignments f
+      balanceCluster
+      cs <- implementAssignments f
       checkpointNode
+      echo $ show cs
       liftIO $ threadDelay 30000000
 
 
@@ -61,6 +94,7 @@ checkpointNode
         MonadState NodeState m)
     => EitherT String m ()
 checkpointNode = do
+    echo "Checkpointing cluster state..."
     ws <- use $ nsWorkers . to M.toList
     forM_ ws $ \ (_sid, (mv, _a)) ->
       syncShardState =<< liftIO (readMVar mv)
@@ -73,6 +107,7 @@ introduceNode
         MonadBaseControl IO m)
     => EitherT String m ()
 introduceNode = do
+    echo "Introducing this node..."
     mkNode >>= setNode
     balanceCluster
 
@@ -90,17 +125,21 @@ mkNode = do
 -- | Query for assignments from Redis and implement this node's
 -- responsibility by forking off worker processes.
 implementAssignments
-    :: (Functor m, MonadIO m, MonadReader AppEnv m,
-        MonadState NodeState m)
-    => Sink Record (ResourceT (ReaderT AppEnv IO)) ()
-    -> EitherT String m ()
+    :: ( Functor m, MonadIO m, MonadReader AppEnv m, MonadBaseControl IO m
+       , MonadCatch m
+       , MonadState NodeState m )
+    => Processor
+    -> EitherT String m ClusterState
 implementAssignments work = do
+    echo "Implementing cluster assignments..."
+
     nid <- view appNodeId
 
-    allStates <- getAllShardStates
-    let m = collectAssignments allStates
+    cs@ClusterState{..} <- getClusterState
+    let m = collectAssignments _clusterShardStates
 
-    states <- hoistEither $ note "Node has no assignment" $ M.lookup nid m
+    states <- hoistEither $ note ("Node " <> show nid <>  " has no assignment") $
+      M.lookup nid m
     let sids = map _shardId states
 
     current <- use nsWorkers
@@ -134,6 +173,8 @@ implementAssignments work = do
         nsWorkers . at sid .= Just (w, a)
 
 
+    return cs
+
 -------------------------------------------------------------------------------
 mkWorkerId :: MonadIO m => m WorkerId
 mkWorkerId = liftIO $ liftM (WorkerId . toS) $ mkRNG >>= randomToken 32
@@ -144,18 +185,21 @@ runWorker
     :: (MonadIO m, MonadReader AppEnv m, MonadCatch m, MonadBaseControl IO m)
     => ShardState
     -> MVar Worker
-    -> Sink Record (ResourceT m) a
-    -> m a
-runWorker s mw f = runResourceT $ streamRecords sid sn =$= updateWorker $$ f
-    where
-      sid = s ^. shardId
-      sn = s ^. shardSeq
+    -> Processor
+    -> m ()
+runWorker s mw f = runResourceT $ do
+    streamRecords sid sn =$= updateWorker =$=
+      C.mapM_ (liftIO . f . Just) $$ C.sinkNull
+    liftIO $ f Nothing
+  where
+    sid = s ^. shardId
+    sn = s ^. shardSeq
 
-      updateWorker = awaitForever $ \ record -> do
-        yield record
-        liftIO $ modifyMVar_ mw $ \ w -> evaluate $ w
-          & workerLastProcessed .~ Just (recordSequenceNumber record)
-          & workerItems %~ (+1)
+    updateWorker = awaitForever $ \ record -> do
+      yield record
+      liftIO $ modifyMVar_ mw $ \ w -> evaluate $ w
+        & workerLastProcessed .~ Just (recordSequenceNumber record)
+        & workerItems %~ (+1)
 
 
 
@@ -188,46 +232,90 @@ buildStateIx :: [ShardState] -> Map ShardId ShardState
 buildStateIx states = M.fromList $ map (_shardId &&& id) states
 
 
+
+-------------------------------------------------------------------------------
+getClusterState
+    :: (MonadIO m, MonadReader AppEnv m, MonadCatch m, MonadBaseControl IO m)
+    => EitherT String m ClusterState
+getClusterState = do
+    shards <- getAllShards
+    states <- getAllShardStates
+
+    (deadNodes, aliveNodes) <- getNodes
+
+    let curAssign = invertMap $ M.map (map _shardId) $ collectAssignments states
+        newAssign = decideAssignments shards states aliveNodes
+
+    return $ ClusterState
+      shards
+      states
+      deadNodes
+      aliveNodes
+      curAssign
+      newAssign
+      (curAssign == newAssign)
+
+
+-------------------------------------------------------------------------------
+-- | Get dead and alive nodes in cluster.
+getNodes = do
+    nodes <- getAllNodes
+    now <- liftIO getCurrentTime
+    nodeDeadGrace <- view $ appConfig . configNodeBeat
+    let isDeadNode n = diffUTCTime now (n ^. nodeLastBeat) > nodeDeadGrace
+    return $ partition isDeadNode nodes
+
+
+-------------------------------------------------------------------------------
+decideAssignments
+    :: [Shard]
+    -> [ShardState]
+    -> [Node]
+    -> Map ShardId NodeId
+decideAssignments shards states aliveNodes = invertMap newAssignment
+  where
+    curAssignment = M.map (map _shardId) $ collectAssignments states
+
+    newAssignment = assign
+      (map _nodeId aliveNodes)
+      (map shardShardId shards)
+      curAssignment
+
+
 -------------------------------------------------------------------------------
 -- | Do a complete pass over shards and node information.
 balanceCluster
     :: (MonadIO m, MonadReader AppEnv m, MonadCatch m, MonadBaseControl IO m)
     => EitherT String m ()
 balanceCluster = do
-    shards <- getAllShards
-    nodes <- getAllNodes
-    states <- getAllShardStates
+    echo "Balancing cluster..."
 
     now <- liftIO $ getCurrentTime
-    nodeDeadGrace <- view $ appConfig . configNodeBeat
 
-    let isDeadNode n = diffUTCTime now (n ^. nodeLastBeat) < nodeDeadGrace
+    ClusterState{..} <- getClusterState
 
-        (deadNodes, aliveNodes) = partition isDeadNode nodes
-
-        curAssignment = M.map (map _shardId) $ collectAssignments states
-
-        newAssignment = assign (map _nodeId aliveNodes) (map shardShardId shards) curAssignment
-
-        newAssignment' = invertMap newAssignment
-
-        oldStateIx = buildStateIx states
+    let oldStateIx = buildStateIx _clusterShardStates
 
 
     -- remove nodes that have disappeared
-    delNodes (map _nodeId deadNodes)
+    unless (null _clusterDeadNodes) $ void $ do
+      echo $ "Deleting " <> show (length _clusterDeadNodes) <>
+             " dead nodes: " <> show _clusterDeadNodes
+      delNodes (map _nodeId _clusterDeadNodes)
 
 
     -- remove shards that have been deleted
-    forM_ states $ \ ss ->
-      whenJust (M.lookup (ss ^. shardId) newAssignment') $ const $ void $
+    forM_ _clusterShardStates $ \ ss ->
+      whenJust (M.lookup (ss ^. shardId) _clusterNewAssignments) $ const $ void $ do
+        echo $ "Deleting stale shard state: " <> show ss
         delShardStates [ss ^. shardId]
 
 
     -- update shard assignments on database
-    forM_ (M.toList newAssignment') $ \ (sid, nid) -> case M.lookup sid oldStateIx of
-      Just ss -> setShardState (ss & shardNode .~ nid)
-      Nothing -> setShardState (ShardState sid nid Nothing now now 0)
+    forM_ (M.toList _clusterNewAssignments) $ \ (sid, nid) ->
+      case M.lookup sid oldStateIx of
+        Just ss -> setShardState (ss & shardNode .~ nid)
+        Nothing -> setShardState (ShardState sid nid Nothing now now 0)
 
 
 
@@ -319,3 +407,8 @@ collect k v f as = foldrOf folded step M.empty as
 whenJust :: Monad m => Maybe t -> (t -> m ()) -> m ()
 whenJust (Just a) f = f a
 whenJust Nothing _ = return ()
+
+
+echo :: MonadIO m => String -> m ()
+echo = liftIO . putStrLn
+

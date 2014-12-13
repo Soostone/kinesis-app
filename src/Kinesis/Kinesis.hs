@@ -7,6 +7,7 @@
 
 module Kinesis.Kinesis where
 
+
 -------------------------------------------------------------------------------
 import           Aws
 import           Aws.Aws
@@ -25,12 +26,11 @@ import           Data.Conduit
 import qualified Data.Conduit.List            as C
 import           Data.Default
 import           Data.String.Conv
+import           Data.Text                    (Text)
 import           Network.HTTP.Conduit
 -------------------------------------------------------------------------------
 import           Kinesis.Types
 -------------------------------------------------------------------------------
-
-
 
 
 -------------------------------------------------------------------------------
@@ -40,7 +40,7 @@ getAllShards
         MonadBaseControl IO m)
     => EitherT String m [Shard]
 getAllShards = bimapEitherT show id $ do
-    nm <- EitherT $ streamName <$> view (appName . unAppName)
+    nm <- getStream
     let ds = DescribeStream Nothing Nothing nm
     runResourceT (awsIteratedList' (runKinesis 10) ds $$ C.take 1000)
 
@@ -53,12 +53,17 @@ streamRecords
     -> Maybe SequenceNumber
     -> Producer (ResourceT n) Record
 streamRecords sid sn = do
-    nm <- either (error.toS) id . streamName <$> view (appName . unAppName)
+    nm <- either (error.toS) id <$> runEitherT getStream
     let gsi = GetShardIterator sid AfterSequenceNumber sn nm
     iter <- lift $ getShardIteratorResShardIterator <$> runKinesis 10 gsi
     let gr = GetRecords Nothing iter
     awsIteratedList' (runKinesis 10) gr
 
+
+getStream
+    :: (Functor m, MonadReader AppEnv m) =>
+     EitherT Text m StreamName
+getStream = EitherT $ streamName <$> view appStream
 
 
 -------------------------------------------------------------------------------

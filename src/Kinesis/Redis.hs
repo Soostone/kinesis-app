@@ -169,8 +169,6 @@ getAllObjects getKey = do
 -------------------------------------------------------------------------------
 
 
-
-
 -------------------------------------------------------------------------------
 -- | Perform an action while acquiring configuration lock.
 lockingConfig
