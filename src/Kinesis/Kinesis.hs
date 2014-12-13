@@ -1,19 +1,21 @@
 {-# LANGUAGE FlexibleContexts          #-}
 {-# LANGUAGE MultiParamTypeClasses     #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
+{-# LANGUAGE OverloadedStrings         #-}
 {-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE TypeFamilies              #-}
 
 module Kinesis.Kinesis where
 
-
 -------------------------------------------------------------------------------
 import           Aws
 import           Aws.Aws
+import           Aws.Core
 import           Aws.General
 import           Aws.Kinesis
 import           Control.Applicative
+import           Control.Concurrent
 import           Control.Error
 import           Control.Exception            (IOException)
 import           Control.Lens
@@ -24,7 +26,7 @@ import           Control.Monad.Trans.Resource
 import           Control.Retry
 import           Data.Conduit
 import qualified Data.Conduit.List            as C
-import           Data.Default
+import           Data.Monoid
 import           Data.String.Conv
 import           Data.Text                    (Text)
 import           Network.HTTP.Conduit
@@ -54,12 +56,22 @@ streamRecords
     -> Producer (ResourceT n) Record
 streamRecords sid sn = do
     nm <- either (error.toS) id <$> runEitherT getStream
-    let gsi = case sn of
-          Nothing -> GetShardIterator sid TrimHorizon Nothing nm
-          Just _ -> GetShardIterator sid AfterSequenceNumber sn nm
+    let pos = case sn of
+          Nothing -> TrimHorizon
+          Just _ -> AfterSequenceNumber
+    let gsi = GetShardIterator sid pos sn nm
     iter <- lift $ getShardIteratorResShardIterator <$> runKinesis 10 gsi
-    let gr = GetRecords Nothing iter
-    awsIteratedList' (runKinesis 10) gr
+    go (GetRecords Nothing iter)
+  where
+    go r = do
+      a <- lift $ runKinesis 10 r
+      case nextIteratedRequest r a of
+        Nothing -> return ()
+        Just r' -> do
+          case null (getRecordsResRecords a) of
+            True -> liftIO $ threadDelay 1000000
+            False -> C.sourceList (getRecordsResRecords a)
+          go r'
 
 
 -------------------------------------------------------------------------------
@@ -96,16 +108,24 @@ runAws
 runAws servConf n r = do
     mgr <- view appManager
     conf <- view appAwsConfig
-    recovering (awsPolicy n) [httpRetryH, networkRetryH] $
+    recovering (awsPolicy n) [kinesisH, httpRetryH, networkRetryH] $
       hoist liftIO $
       pureAws conf servConf mgr r
 
+
+-------------------------------------------------------------------------------
+kinesisH :: Monad m => t -> Handler m Bool
+kinesisH _ = Handler $ \e -> return $ case e of
+  KinesisErrorResponse cd _msg -> case cd of
+    "ProvisionedThroughputExceededException" -> True
+    _ -> False
+  _ -> False
 
 
 -------------------------------------------------------------------------------
 awsPolicy :: Int -> RetryPolicy
 awsPolicy n = capDelay 60000000 $
-              def <> limitRetries n <> exponentialBackoff 25000
+              mempty <> limitRetries n <> exponentialBackoff 25000
 
 
 

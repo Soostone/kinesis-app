@@ -37,6 +37,7 @@ import           Data.RNG
 import qualified Data.Set                     as S
 import           Data.String.Conv
 import           Data.Time
+import           LiveStats
 import           Safe                         (fromJustNote)
 -------------------------------------------------------------------------------
 import           Kinesis.Kinesis
@@ -73,33 +74,38 @@ processorSink f run = do
 -------------------------------------------------------------------------------
 -- | The single-threaded master control loop.
 masterLoop
-    :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+    :: (MonadIO m, MonadCatch m, MonadBaseControl IO m, MonadMask m)
     => AppEnv
     -> Processor
     -> m (Either String ())
 masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
     delay <- view configLoopDelay <&> (*1000000)
 
-    introduceNode
+    stats <- liftIO newStats
+    liftIO $ addCounter stats "records"
+    liftIO . async $ reportStats stats 30
+
+    joinE $ lockingConfig introduceNode
 
     forever $ do
-      balanceCluster
-      cs <- implementAssignments f
-      checkpointNode
-      echo $ show cs
-      updateNode
+      joinE $ lockingConfig $ do
+        balanceCluster
+        cs <- implementAssignments f stats
+        checkpointWorkers
+        echo $ show cs
+        updateNode
       liftIO $ threadDelay delay
 
 
 -------------------------------------------------------------------------------
 -- | Look into workers managed by this node and checkpoint their
 -- status to central database.
-checkpointNode
+checkpointWorkers
     :: (Functor m, MonadIO m, MonadReader AppEnv m,
         MonadState NodeState m)
     => EitherT String m ()
-checkpointNode = do
-    echo "Checkpointing cluster state..."
+checkpointWorkers = do
+    echo "Checkpointing worker state..."
     ws <- use $ nsWorkers . to M.toList
     forM_ ws $ \ (_sid, (mv, _a)) -> do
       echo $ "Syncing state for " <> show _sid
@@ -135,7 +141,6 @@ updateNode
     :: (Functor m, MonadIO m, MonadReader AppEnv m)
     => EitherT String m Bool
 updateNode = do
-    echo "Incrementing node heartbeat..."
     nid <- view appNodeId
     n <- getNode nid
     now <- liftIO getCurrentTime
@@ -150,8 +155,9 @@ implementAssignments
        , MonadCatch m
        , MonadState NodeState m )
     => Processor
+    -> Stats
     -> EitherT String m ClusterState
-implementAssignments work = do
+implementAssignments work stats = do
     echo "Implementing cluster assignments..."
 
     nid <- view appNodeId
@@ -180,7 +186,9 @@ implementAssignments work = do
 
 
     -- kill cancelled assignments
-    echo $ "Killing " <> show (length kills) <> " workers..."
+    when (not (null kills)) $
+      echo $ "Killing " <> show (length kills) <> " workers..."
+
     forM_ kills $ \ (sid, (mv, a)) -> do
       w <- liftIO $ readMVar mv
       echo $ "Killing worker: " <> show w
@@ -189,13 +197,20 @@ implementAssignments work = do
 
 
     -- implement new workers
-    echo $ "Spawning " <> show (length news) <> " new workers..."
+    when (not (null news)) $
+      echo $ "Spawning " <> show (length news) <> " new workers..."
+
     ae <- ask
     forM_ news $ \ s -> do
       wid <- mkWorkerId
       let sid = shardId s
-      w <- liftIO $ newMVar (Worker wid sid now Nothing 0)
-      a <- liftIO $ async (runReaderT (runWorker s w work) ae)
+          curSeq = _shardSeq s
+          curCount = _shardItems s
+      w <- liftIO $ newMVar (Worker wid sid now curSeq curCount)
+
+      a <- liftIO $ async (runReaderT (runWorker stats s w work) ae)
+      liftIO $ link a
+
       nsWorkers . at sid .= Just (w, a)
 
 
@@ -209,15 +224,17 @@ mkWorkerId = liftIO $ liftM (WorkerId . toS) $ mkRNG >>= randomToken 32
 -------------------------------------------------------------------------------
 runWorker
     :: (MonadIO m, MonadReader AppEnv m, MonadCatch m, MonadBaseControl IO m)
-    => ShardState
+    => Stats
+    -> ShardState
     -> MVar Worker
     -> Processor
     -> m ()
-runWorker s mw f = runResourceT $ do
+runWorker stats s mw f = runResourceT $ do
     mkNow <- liftIO $
       mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
 
     liftIO $ async $ forever $ do
+      threadDelay 1000000
       now <- mkNow
       modifyMVar_ mw $ \ w -> evaluate $ w
         & workerLastBeat .~ now
@@ -231,8 +248,9 @@ runWorker s mw f = runResourceT $ do
     sn = s ^. shardSeq
 
     go = awaitForever $ \ record -> liftIO $ do
-      echo "Processing a record..."
+      -- echo "Processing a record..."
       f (Just record)
+      incStats stats "records" 1
       modifyMVar_ mw $ \ w -> evaluate $ w
         & workerLastProcessed .~ Just (recordSequenceNumber record)
         & workerItems %~ (+1)

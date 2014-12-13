@@ -168,13 +168,17 @@ getAllObjects getKey = do
 -- |
 -------------------------------------------------------------------------------
 
+joinE :: (Monad m, Show e) => EitherT String m (Either e a) -> EitherT String m a
+joinE m = do
+    a <- m
+    either (left . show) return a
 
 -------------------------------------------------------------------------------
 -- | Perform an action while acquiring configuration lock.
 lockingConfig
-    :: (MonadIO m, MonadReader AppEnv m, MonadMask m)
+    :: (MonadIO m, MonadReader AppEnv m, MonadCatch m)
     => m b
-    -> m b
+    -> m (Either SomeException b)
 lockingConfig f = do
     lk <- lockKey
     r <- view appRedis
@@ -182,7 +186,10 @@ lockingConfig f = do
     let lock = liftIO $ runRedis r $ blockLock redisPolicy "kinesis" 10 lk
         unlock = liftIO $ runRedis r $ releaseLock "kinesis" lk
 
-    bracket_ lock unlock f
+    lock
+    res <- try f
+    unlock
+    return res
 
 
 -------------------------------------------------------------------------------
