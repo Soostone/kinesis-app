@@ -11,6 +11,7 @@ module Kinesis.Coordination where
 -------------------------------------------------------------------------------
 import           Aws.Kinesis
 import           Control.Arrow
+import           Control.AutoUpdate
 import           Control.Concurrent           (threadDelay)
 import           Control.Concurrent.Async
 import           Control.Concurrent.MVar
@@ -36,6 +37,7 @@ import           Data.RNG
 import qualified Data.Set                     as S
 import           Data.String.Conv
 import           Data.Time
+import           Safe                         (fromJustNote)
 -------------------------------------------------------------------------------
 import           Kinesis.Kinesis
 import           Kinesis.Redis
@@ -76,6 +78,8 @@ masterLoop
     -> Processor
     -> m (Either String ())
 masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
+    delay <- view configLoopDelay <&> (*1000000)
+
     introduceNode
 
     forever $ do
@@ -83,7 +87,8 @@ masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
       cs <- implementAssignments f
       checkpointNode
       echo $ show cs
-      liftIO $ threadDelay 30000000
+      updateNode
+      liftIO $ threadDelay delay
 
 
 -------------------------------------------------------------------------------
@@ -96,8 +101,11 @@ checkpointNode
 checkpointNode = do
     echo "Checkpointing cluster state..."
     ws <- use $ nsWorkers . to M.toList
-    forM_ ws $ \ (_sid, (mv, _a)) ->
-      syncShardState =<< liftIO (readMVar mv)
+    forM_ ws $ \ (_sid, (mv, _a)) -> do
+      echo $ "Syncing state for " <> show _sid
+      w <- liftIO $ readMVar mv
+      echo $ "Worker state: " <> show w
+      syncShardState w
 
 
 -------------------------------------------------------------------------------
@@ -122,6 +130,19 @@ mkNode = do
 
 
 -------------------------------------------------------------------------------
+-- | Update node heartbeat.
+updateNode
+    :: (Functor m, MonadIO m, MonadReader AppEnv m)
+    => EitherT String m Bool
+updateNode = do
+    echo "Incrementing node heartbeat..."
+    nid <- view appNodeId
+    n <- getNode nid
+    now <- liftIO getCurrentTime
+    setNode $ n & nodeLastBeat .~ now
+
+
+-------------------------------------------------------------------------------
 -- | Query for assignments from Redis and implement this node's
 -- responsibility by forking off worker processes.
 implementAssignments
@@ -136,41 +157,46 @@ implementAssignments work = do
     nid <- view appNodeId
 
     cs@ClusterState{..} <- getClusterState
-    let m = collectAssignments _clusterShardStates
+    let m = collectAssignments _clusterActiveShards
 
     states <- hoistEither $ note ("Node " <> show nid <>  " has no assignment") $
       M.lookup nid m
-    let sids = map _shardId states
+    let sids = map shardId states
 
     current <- use nsWorkers
 
+    now <- liftIO getCurrentTime
+    grace <- view $ appConfig . configGraceDelay
+
     let isOld k _ = not $ k `elem` sids
 
-        isNew s = isNothing $ M.lookup (_shardId s) current
+        isNew s = isNothing $ M.lookup (shardId s) current
 
         kills = M.toList $ M.filterWithKey isOld current
 
-        news = filter isNew states
+        passedGrace s = diffUTCTime now (s ^. shardAssigned) > grace
+
+        news = filter (\s -> isNew s && passedGrace s) states
 
 
     -- kill cancelled assignments
-    forM_ kills $ \ (sid, (_w, a)) -> do
+    echo $ "Killing " <> show (length kills) <> " workers..."
+    forM_ kills $ \ (sid, (mv, a)) -> do
+      w <- liftIO $ readMVar mv
+      echo $ "Killing worker: " <> show w
       liftIO $ cancel a
       nsWorkers . at sid .= Nothing
 
 
     -- implement new workers
+    echo $ "Spawning " <> show (length news) <> " new workers..."
     ae <- ask
     forM_ news $ \ s -> do
       wid <- mkWorkerId
-      now <- liftIO getCurrentTime
-      grace <- view $ appConfig . configGraceDelay
-
-      when (diffUTCTime now (s ^. shardAssigned) > grace) $ do
-        let sid = s ^. shardId
-        w <- liftIO $ newMVar (Worker wid sid now Nothing 0)
-        a <- liftIO $ async (runReaderT (runWorker s w work) ae)
-        nsWorkers . at sid .= Just (w, a)
+      let sid = shardId s
+      w <- liftIO $ newMVar (Worker wid sid now Nothing 0)
+      a <- liftIO $ async (runReaderT (runWorker s w work) ae)
+      nsWorkers . at sid .= Just (w, a)
 
 
     return cs
@@ -188,16 +214,26 @@ runWorker
     -> Processor
     -> m ()
 runWorker s mw f = runResourceT $ do
-    streamRecords sid sn =$= updateWorker =$=
-      C.mapM_ (liftIO . f . Just) $$ C.sinkNull
+    mkNow <- liftIO $
+      mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
+
+    liftIO $ async $ forever $ do
+      now <- mkNow
+      modifyMVar_ mw $ \ w -> evaluate $ w
+        & workerLastBeat .~ now
+
+    streamRecords sid sn =$= go $$ C.sinkNull
+
     liftIO $ f Nothing
+
   where
-    sid = s ^. shardId
+    sid = shardId s
     sn = s ^. shardSeq
 
-    updateWorker = awaitForever $ \ record -> do
-      yield record
-      liftIO $ modifyMVar_ mw $ \ w -> evaluate $ w
+    go = awaitForever $ \ record -> liftIO $ do
+      echo "Processing a record..."
+      f (Just record)
+      modifyMVar_ mw $ \ w -> evaluate $ w
         & workerLastProcessed .~ Just (recordSequenceNumber record)
         & workerItems %~ (+1)
 
@@ -211,10 +247,17 @@ syncShardState
     -> EitherT String m Bool
 syncShardState w = do
     ss <- getShardState (w ^. workerShard)
+    now <- liftIO getCurrentTime
+
+    let curSeq = w ^. workerLastProcessed
+        completed = isJust curSeq &&
+                    (curSeq == (ss ^. shard . to shardSequenceNumberRange . _2))
+
     setShardState $ ss
-      & shardSeq      .~ (w ^. workerLastProcessed)
-      & shardLastBeat .~ (w ^. workerLastBeat)
-      & shardItems    .~ (w ^. workerItems)
+      & shardSeq       .~ curSeq
+      & shardCompleted .~ completed
+      & shardItems     .~ (w ^. workerItems)
+      & shardLastBeat  .~ now
 
 
 
@@ -229,7 +272,7 @@ collectAssignments states = collect _shardNode return (++) states
 
 -------------------------------------------------------------------------------
 buildStateIx :: [ShardState] -> Map ShardId ShardState
-buildStateIx states = M.fromList $ map (_shardId &&& id) states
+buildStateIx states = M.fromList $ map (shardId &&& id) states
 
 
 
@@ -240,20 +283,22 @@ getClusterState
 getClusterState = do
     shards <- getAllShards
     states <- getAllShardStates
+    let activeStates = filter (not . _shardCompleted) states
 
     (deadNodes, aliveNodes) <- getNodes
 
-    let curAssign = invertMap $ M.map (map _shardId) $ collectAssignments states
-        newAssign = decideAssignments shards states aliveNodes
+    let curAssign = invertMap $ M.map (map shardId) $ collectAssignments states
+        newAssign = decideAssignments shards activeStates aliveNodes
 
     return $ ClusterState
-      shards
+      (M.fromList $ map (shardShardId &&& id) shards)
       states
+      activeStates
       deadNodes
       aliveNodes
       curAssign
       newAssign
-      (curAssign == newAssign)
+      (curAssign /= newAssign)
 
 
 -------------------------------------------------------------------------------
@@ -274,7 +319,9 @@ decideAssignments
     -> Map ShardId NodeId
 decideAssignments shards states aliveNodes = invertMap newAssignment
   where
-    curAssignment = M.map (map _shardId) $ collectAssignments states
+
+    curAssignment :: Map NodeId [ShardId]
+    curAssignment = M.map (map shardId) $ collectAssignments states
 
     newAssignment = assign
       (map _nodeId aliveNodes)
@@ -304,18 +351,22 @@ balanceCluster = do
       delNodes (map _nodeId _clusterDeadNodes)
 
 
-    -- remove shards that have been deleted
-    forM_ _clusterShardStates $ \ ss ->
-      whenJust (M.lookup (ss ^. shardId) _clusterNewAssignments) $ const $ void $ do
-        echo $ "Deleting stale shard state: " <> show ss
-        delShardStates [ss ^. shardId]
+    -- TODO remove shards that have been deleted
+    -- forM_ _clusterShardStates $ \ ss ->
+    --   whenJust (M.lookup (ss ^. shardId) _clusterNewAssignments) $ const $ void $ do
+    --     echo $ "Deleting stale shard state: " <> show ss
+    --     delShardStates [ss ^. shardId]
 
 
     -- update shard assignments on database
     forM_ (M.toList _clusterNewAssignments) $ \ (sid, nid) ->
       case M.lookup sid oldStateIx of
-        Just ss -> setShardState (ss & shardNode .~ nid)
-        Nothing -> setShardState (ShardState sid nid Nothing now now 0)
+        Just ss -> case ss ^. shardNode == nid of
+          True -> return ()
+          False -> void $ setShardState (ss & shardNode .~ nid & shardAssigned .~ now)
+        Nothing -> void $ setShardState $
+          let s = fromJustNote "Impossible: ShardId not found" $ M.lookup sid _clusterShards
+          in ShardState s nid Nothing False now now 0
 
 
 

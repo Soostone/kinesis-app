@@ -65,7 +65,7 @@ setShardState
     :: (MonadIO m, Functor m, MonadReader AppEnv m)
     => ShardState
     -> EitherT String m Bool
-setShardState = setObject shardKey (shardId . to (toS.show))
+setShardState = setObject shardKey (shard . to shardShardId . to (toS.show))
 
 
 -------------------------------------------------------------------------------

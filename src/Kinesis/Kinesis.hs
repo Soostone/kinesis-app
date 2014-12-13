@@ -54,12 +54,16 @@ streamRecords
     -> Producer (ResourceT n) Record
 streamRecords sid sn = do
     nm <- either (error.toS) id <$> runEitherT getStream
-    let gsi = GetShardIterator sid AfterSequenceNumber sn nm
+    let gsi = case sn of
+          Nothing -> GetShardIterator sid TrimHorizon Nothing nm
+          Just _ -> GetShardIterator sid AfterSequenceNumber sn nm
     iter <- lift $ getShardIteratorResShardIterator <$> runKinesis 10 gsi
     let gr = GetRecords Nothing iter
     awsIteratedList' (runKinesis 10) gr
 
 
+-------------------------------------------------------------------------------
+-- | Grab stream name from app env.
 getStream
     :: (Functor m, MonadReader AppEnv m) =>
      EitherT Text m StreamName

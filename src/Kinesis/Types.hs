@@ -41,13 +41,15 @@ newtype NodeId = NodeId { _unNodeId :: Text }
 -------------------------------------------------------------------------------
 data AppEnv = AppEnv {
       _appName      :: AppName
+    -- ^ A name for this app, in case several are running.
     , _appStream    :: Text
+    -- ^ Kinesis stream to pull data from
     , _appRedis     :: R.Connection
     , _appManager   :: Manager
     , _appAwsConfig :: Aws.Configuration
     , _appIp        :: Text
     , _appNodeId    :: NodeId
-    , _appConfig    :: AppConfig
+    , _aeAppConfig  :: AppConfig
     }
 
 
@@ -74,16 +76,20 @@ instance Default NodeState where
 -------------------------------------------------------------------------------
 -- | Last state for each known shard in cluster.
 data ShardState = ShardState {
-      _shardId       :: ShardId
-    , _shardNode     :: NodeId
-    , _shardSeq      :: Maybe SequenceNumber
-    , _shardLastBeat :: UTCTime
-    , _shardAssigned :: UTCTime
+      _shard          :: Shard
+    , _shardNode      :: NodeId
+    , _shardSeq       :: Maybe SequenceNumber
+    , _shardCompleted :: Bool
+    , _shardLastBeat  :: UTCTime
+    , _shardAssigned  :: UTCTime
     -- ^ When the assignment was made. We wait a grace period after
     -- this to start processing in case assignments change rapidly.
-    , _shardItems    :: !Int64
+    , _shardItems     :: !Int64
     } deriving (Eq,Show,Read,Ord)
 
+
+shardId :: ShardState -> ShardId
+shardId = shardShardId . _shard
 
 -------------------------------------------------------------------------------
 -- | Node metadata stored in database
@@ -106,9 +112,12 @@ data Worker = Worker {
     } deriving (Eq,Show,Read,Ord)
 
 
+-------------------------------------------------------------------------------
+-- | Overall cluster state, pulled into one place for a convenient package.
 data ClusterState = ClusterState {
-      _clusterShards         :: [Shard]
+      _clusterShards         :: Map ShardId Shard
     , _clusterShardStates    :: [ShardState]
+    , _clusterActiveShards   :: [ShardState]
     , _clusterDeadNodes      :: [Node]
     , _clusterAliveNodes     :: [Node]
     , _clusterAssignments    :: Map ShardId NodeId
@@ -123,13 +132,16 @@ makeLenses ''NodeId
 makeLenses ''AppName
 makeLenses ''Worker
 makeLenses ''Node
-makeLenses ''AppEnv
-makeLenses ''AppConfig
 makeLenses ''NodeState
 makeLenses ''ShardState
 makeLenses ''ClusterState
 -------------------------------------------------------------------------------
+makeClassy ''AppEnv
+makeClassy ''AppConfig
+-------------------------------------------------------------------------------
 
+instance HasAppConfig AppEnv where
+    appConfig = aeAppConfig
 
 -------------------------------------------------------------------------------
 $(deriveJSON defaultOptions {fieldLabelModifier = drop 7, constructorTagModifier = map toLower} ''Worker)
