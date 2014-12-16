@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE TemplateHaskell            #-}
 
 module Kinesis.Types where
@@ -6,6 +7,7 @@ module Kinesis.Types where
 -------------------------------------------------------------------------------
 import           Aws
 import           Aws.Kinesis.Types
+import           Control.Applicative
 import           Control.Concurrent.Async
 import           Control.Concurrent.MVar
 import           Control.Lens
@@ -16,9 +18,13 @@ import           Data.Default
 import           Data.Int
 import           Data.Map.Strict          (Map)
 import qualified Data.Map.Strict          as M
+import           Data.Monoid
+import           Data.RNG
+import           Data.String.Conv
 import           Data.Text                (Text)
 import           Data.Time
 import qualified Database.Redis           as R
+import           Network.HostName
 import           Network.HTTP.Client
 -------------------------------------------------------------------------------
 
@@ -47,10 +53,17 @@ data AppEnv = AppEnv {
     , _appRedis     :: R.Connection
     , _appManager   :: Manager
     , _appAwsConfig :: Aws.Configuration
-    , _appIp        :: Text
     , _appNodeId    :: NodeId
     , _aeAppConfig  :: AppConfig
     }
+
+
+-------------------------------------------------------------------------------
+mkNodeId :: IO NodeId
+mkNodeId = do
+    hn <- toS <$> getHostName
+    tk <- mkRNG >>= randomToken 8
+    return $ NodeId $ hn <> "-" <> toS tk
 
 
 -------------------------------------------------------------------------------
@@ -95,7 +108,6 @@ shardId = shardShardId . _shard
 -- | Node metadata stored in database
 data Node = Node {
       _nodeId       :: NodeId
-    , _nodeIp       :: Text
     , _nodeLastBeat :: UTCTime
     , _nodeInit     :: UTCTime
     } deriving (Eq,Show,Read,Ord)

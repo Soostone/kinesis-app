@@ -70,7 +70,6 @@ processorSink f run = do
 
 
 
-
 -------------------------------------------------------------------------------
 -- | The single-threaded master control loop.
 masterLoop
@@ -129,10 +128,9 @@ introduceNode = do
 -------------------------------------------------------------------------------
 mkNode :: (MonadIO m, MonadReader AppEnv m) => m Node
 mkNode = do
-    ip <- view appIp
     nid <- view appNodeId
     now <- liftIO getCurrentTime
-    return $ Node nid ip now now
+    return $ Node nid now now
 
 
 -------------------------------------------------------------------------------
@@ -165,9 +163,10 @@ implementAssignments work stats = do
     cs@ClusterState{..} <- getClusterState
     let m = collectAssignments _clusterActiveShards
 
-    states <- hoistEither $ note ("Node " <> show nid <>  " has no assignment") $
-      M.lookup nid m
+    let states = fromMaybe [] $ M.lookup nid m
     let sids = map shardId states
+
+    when (null states) $ echo $ "No shards have been assigned to this node..."
 
     current <- use nsWorkers
 
@@ -355,18 +354,16 @@ balanceCluster
 balanceCluster = do
     echo "Balancing cluster..."
 
-    now <- liftIO $ getCurrentTime
-
     ClusterState{..} <- getClusterState
-
     let oldStateIx = buildStateIx _clusterShardStates
 
 
-    -- remove nodes that have disappeared
+    -- first, remove nodes that have disappeared
     unless (null _clusterDeadNodes) $ void $ do
       echo $ "Deleting " <> show (length _clusterDeadNodes) <>
              " dead nodes: " <> show _clusterDeadNodes
       delNodes (map _nodeId _clusterDeadNodes)
+
 
 
     -- TODO remove shards that have been deleted
@@ -374,6 +371,8 @@ balanceCluster = do
     --   whenJust (M.lookup (ss ^. shardId) _clusterNewAssignments) $ const $ void $ do
     --     echo $ "Deleting stale shard state: " <> show ss
     --     delShardStates [ss ^. shardId]
+
+    now <- liftIO $ getCurrentTime
 
 
     -- update shard assignments on database
@@ -397,12 +396,17 @@ assign as bs cur = new
       cur' = M.toList cur
 
       oldAs = map fst cur'
-      deadAs = S.fromList $ oldAs \\ as
+      deadAs' = oldAs \\ as
+      deadAs = S.fromList deadAs'
       newAs = as \\ oldAs
 
       oldBs = concatMap snd cur'
       deadBs = S.fromList $ oldBs \\ bs
       newBs = bs \\ oldBs
+
+      -- some Bs are going to be lost when we kill the As that carry
+      -- them right now
+      reassignBs = concat $ mapMaybe (flip M.lookup cur) deadAs'
 
       new = M.fromList .
 
@@ -410,7 +414,7 @@ assign as bs cur = new
             balanceAssignments .
 
             -- add all the new bs to the first a you see
-            (ix 0 . _2 %~ (newBs ++ )) .
+            (ix 0 . _2 %~ ((reassignBs ++ newBs) ++ )) .
 
             -- add the brand new as with empty assignments
             (zip newAs (repeat []) ++ ) .

@@ -32,10 +32,10 @@ coordinationTests = testGroup "Kinesis.Coordination"
 assignmentTests :: TestTree
 assignmentTests = testGroup "shard assignment"
   [ testProperty "all as are there" $
-      withItems (\ as bs -> M.keys (assign as bs M.empty) == sort as)
+      withItems (\ as bs -> M.keys (assign as bs M.empty) == as)
 
   , testProperty "all bs are there" $
-      withItems (\ as bs -> (sort . concat . M.elems $ (assign as bs M.empty)) == sort bs)
+      withItems (\ as bs -> (sort . concat . M.elems $ (assign as bs M.empty)) == bs)
 
   , testProperty "assignment is balanced" $
       withItems (\ as bs ->
@@ -50,7 +50,25 @@ assignmentTests = testGroup "shard assignment"
             m' = assign as bs m
         in m == m' )
 
+  , testProperty "changing as are handled properly" prop_changingAs
+
   ]
+
+
+prop_changingAs :: NonEmpty Int -> NonEmpty Int -> NonEmpty Char -> Property IO
+prop_changingAs as as2 bs  = forAll $
+  let as' = clr as
+      as2' = clr as2
+      bs' = clr bs
+      m = assign as' bs' M.empty
+      m' = assign as2' bs' m
+  in do
+    withReason (M.keys m' == as2') "From keys not equal"
+    withReason ((sort . concat) (M.elems m') == bs') "To keys not equal"
+
+
+withReason :: Bool -> String -> Either String String
+withReason test msg = if test then Right "OK" else Left msg
 
 
 -------------------------------------------------------------------------------
@@ -60,12 +78,14 @@ withItems
     -> NonEmpty Int
     -> NonEmpty Char
     -> Property IO
-withItems f as bs = changeDepth (min 6) $ f as' bs'
+withItems f as bs = forAll $ f as' bs'
   where
-    clr :: Eq t => NonEmpty t -> [t]
-    clr = nub . getNonEmpty
     as' = clr as
     bs' = clr bs
+
+
+clr :: (Ord t, Eq t) => NonEmpty t -> [t]
+clr = sort . nub . getNonEmpty
 
 
 
