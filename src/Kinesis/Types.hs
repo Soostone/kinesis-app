@@ -74,6 +74,7 @@ data AppConfig = AppConfig {
     -- ^ How long before we start working on a new assignment
     , _configNodeBeat   :: NominalDiffTime
     -- ^ How long before we consider a node dead
+    , _configVerbose    :: Bool
     }
 
 

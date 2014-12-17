@@ -91,7 +91,8 @@ masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
         balanceCluster
         cs <- implementAssignments f stats
         checkpointWorkers
-        echo $ show cs
+        when (ae ^. aeAppConfig . configVerbose) $
+          echo (show cs)
         updateNode
       liftIO $ threadDelay delay
 
@@ -105,11 +106,13 @@ checkpointWorkers
     => EitherT String m ()
 checkpointWorkers = do
     echo "Checkpointing worker state..."
+    ae <- ask
     ws <- use $ nsWorkers . to M.toList
     forM_ ws $ \ (_sid, (mv, _a)) -> do
       echo $ "Syncing state for " <> show _sid
       w <- liftIO $ readMVar mv
-      echo $ "Worker state: " <> show w
+      when (ae ^. aeAppConfig . configVerbose) $
+        echo $ "Worker state: " <> show w
       syncShardState w
 
 
