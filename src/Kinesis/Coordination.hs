@@ -59,13 +59,14 @@ processorSink
     -> (forall a. n a -> IO a)
     -> IO (Maybe Record -> IO ())
 processorSink f run = do
-    ch <- atomically $ newTBQueue 1024
+    ch <- atomically $ newTBQueue 1
     let go = do
             a <- liftIO $ atomically $ readTBQueue ch
             case a of
               Nothing -> return ()
               Just a' -> yield a' >> go
 
+    -- exceptions in slave nodes kill the master process
     async (run $ go $$ f) >>= link
     return $ \ a -> atomically (writeTBQueue ch a)
 
