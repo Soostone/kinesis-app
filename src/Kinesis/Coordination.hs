@@ -39,6 +39,7 @@ import           Data.String.Conv
 import           Data.Time
 import           LiveStats
 import           Safe                         (fromJustNote)
+import           System.IO
 -------------------------------------------------------------------------------
 import           Kinesis.Kinesis
 import           Kinesis.Redis
@@ -78,6 +79,7 @@ masterLoop
     -> Processor
     -> m (Either String ())
 masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
+    liftIO $ hSetBuffering stdout LineBuffering
     delay <- view configLoopDelay <&> (*1000000)
 
     stats <- liftIO newStats
