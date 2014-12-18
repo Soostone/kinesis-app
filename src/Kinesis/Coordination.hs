@@ -155,6 +155,24 @@ updateNode = do
 
 
 -------------------------------------------------------------------------------
+-- | Remove dead workers from state so they are re-spawned
+pruneDeadWorkers :: (MonadIO m, MonadState NodeState m) => m ()
+pruneDeadWorkers = do
+    ws <- use $ nsWorkers . to M.toList
+    forM_ ws $ \ (sid, (mv, a)) -> do
+      chk <- liftIO $ poll a
+      case chk of
+        Nothing -> return ()
+        Just (Right _) -> do
+          w <- liftIO $ readMVar mv
+          error $ "Unexpected: Worker " <> show (w ^. workerId ) <> " has finished working."
+        Just (Left _) -> do
+          w <- liftIO $ readMVar mv
+          echo $ "Worker " <> show (w ^. workerId) <> " has died. Removing."
+          nsWorkers . at sid .= Nothing
+
+
+-------------------------------------------------------------------------------
 -- | Query for assignments from Redis and implement this node's
 -- responsibility by forking off worker processes.
 implementAssignments
@@ -176,6 +194,8 @@ implementAssignments work stats = do
     let sids = map shardId states
 
     when (null states) $ echo $ "No shards have been assigned to this node..."
+
+    pruneDeadWorkers
 
     current <- use nsWorkers
 
