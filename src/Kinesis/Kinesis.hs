@@ -97,7 +97,6 @@ runKinesis n r = runAws kc n r
       kc = KinesisConfiguration UsEast1
 
 
-
 -------------------------------------------------------------------------------
 runAws
     :: (Transaction r b, MonadIO n,
@@ -117,15 +116,18 @@ runAws servConf n r = do
 
 
 -------------------------------------------------------------------------------
-kinesisH :: Monad m => t -> Handler m Bool
-kinesisH _ = Handler $ \e -> return $ case e of
-  KinesisErrorResponse cd _msg -> case cd of
-    "ProvisionedThroughputExceededException" -> True
-    _ -> False
-  KinesisOtherError stat _ -> case stat of
-    Status _ "Internal Server Error" -> True
-    _ -> False
-  _ -> False
+kinesisH :: MonadIO m => Int -> Handler m Bool
+kinesisH n = Handler $ \e -> do
+  let chk = case e of
+          KinesisErrorResponse cd _msg -> case cd of
+            "ProvisionedThroughputExceededException" -> True
+            _ -> False
+          KinesisOtherError stat _ -> case stat of
+            Status _ "Internal Server Error" -> True
+            _ -> False
+          _ -> False
+  when chk $ retryMsg n e
+  return chk
 
 
 -------------------------------------------------------------------------------
@@ -137,10 +139,13 @@ awsPolicy n = capDelay 60000000 $
 
 -------------------------------------------------------------------------------
 -- | Which exceptions should we retry?
-httpRetryH :: Monad m => Int -> Handler m Bool
-httpRetryH _ = Handler f
+httpRetryH :: MonadIO m => Int -> Handler m Bool
+httpRetryH n = Handler f
     where
-      f = return . httpRetry
+      f e = do
+          let chk = httpRetry e
+          when chk $ retryMsg n e
+          return chk
 
 
 -------------------------------------------------------------------------------
@@ -164,7 +169,16 @@ httpRetry e =
 
 -------------------------------------------------------------------------------
 -- | 'IOException's should be retried
-networkRetryH :: Monad m => Int -> Handler m Bool
-networkRetryH = const $ Handler $ \ (_ :: IOException) -> return True
+networkRetryH :: MonadIO m => Int -> Handler m Bool
+networkRetryH n = Handler $ \ (e :: IOException) -> do
+    retryMsg n e
+    return True
+
+
+-------------------------------------------------------------------------------
+retryMsg :: (Show e, MonadIO m) => Int -> e -> m ()
+retryMsg n e = liftIO $ putStrLn $
+  "[retry:" <> show n <> "] Encountered " <> show e <> ". Retrying."
+
 
 
