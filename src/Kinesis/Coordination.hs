@@ -214,7 +214,14 @@ implementAssignments work stats = do
       w <- liftIO $ newMVar (Worker wid sid now curSeq curCount)
 
       a <- liftIO $ async (runReaderT (runWorker stats s w work) ae)
-      liftIO $ link a
+      liftIO $ async $ do
+        res <- waitCatch a
+        case res of
+          Right _ -> return ()
+          Left e -> liftIO $ do
+            w' <- readMVar w
+            echo ("Worker died or was killed with error: "
+                  <> show e <> " - " <> show w')
 
       nsWorkers . at sid .= Just (w, a)
 
