@@ -145,9 +145,14 @@ httpRetry e =
       TooManyRetries{} -> True
       ResponseTimeout{} -> True
       FailedConnectionException{} -> True
+      FailedConnectionException2{} -> True
       InternalIOException{} -> True
       -- ProxyConnectException{} -> True
       StatusCodeException{} -> True
+      NoResponseDataReceived{} -> True
+      ResponseBodyTooShort{} -> True
+      InvalidChunkHeaders{} -> True
+      IncompleteHeaders{} -> True
       _ -> False
 
 
