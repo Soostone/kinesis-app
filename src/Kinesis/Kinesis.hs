@@ -30,6 +30,7 @@ import           Data.Monoid
 import           Data.String.Conv
 import           Data.Text                    (Text)
 import           Network.HTTP.Conduit
+import           Network.HTTP.Types.Status
 -------------------------------------------------------------------------------
 import           Kinesis.Types
 -------------------------------------------------------------------------------
@@ -44,7 +45,7 @@ getAllShards
 getAllShards = bimapEitherT show id $ do
     nm <- getStream
     let ds = DescribeStream Nothing Nothing nm
-    runResourceT (awsIteratedList' (runKinesis 10) ds $$ C.take 1000)
+    runResourceT (awsIteratedList' (runKinesis 10) ds $$ C.take 10000)
 
 
 -------------------------------------------------------------------------------
@@ -118,6 +119,9 @@ kinesisH :: Monad m => t -> Handler m Bool
 kinesisH _ = Handler $ \e -> return $ case e of
   KinesisErrorResponse cd _msg -> case cd of
     "ProvisionedThroughputExceededException" -> True
+    _ -> False
+  KinesisOtherError stat _ -> case stat of
+    Status _ "Internal Server Error" -> True
     _ -> False
   _ -> False
 
