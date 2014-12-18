@@ -47,19 +47,22 @@ import           Kinesis.Types
 -------------------------------------------------------------------------------
 
 
--- | Processors get fed records and they work their magic.
-type Processor  = Maybe Record -> IO ()
+-- | A processor is a record paired with an ACK action that you must
+-- call upon completing record's processing.
+type Processor  = Maybe (Record, IO ()) -> IO ()
 
 
 -------------------------------------------------------------------------------
 -- | Turn a sink into a processor
 processorSink
     :: MonadIO n
-    => Sink Record n ()
+    => Sink (Record, IO ()) n ()
     -> (forall a. n a -> IO a)
-    -> IO (Maybe Record -> IO ())
-processorSink f run = do
-    ch <- atomically $ newTBQueue 1
+    -> Int
+    -- ^ Concurrent queue buffer size
+    -> IO Processor
+processorSink f run lim = do
+    ch <- atomically $ newTBQueue lim
     let go = do
             a <- liftIO $ atomically $ readTBQueue ch
             case a of
@@ -196,7 +199,7 @@ implementAssignments work stats = do
 
     forM_ kills $ \ (sid, (mv, a)) -> do
       w <- liftIO $ readMVar mv
-      echo $ "Killing worker: " <> show w
+      echo $ "Killing worker " <> show (w ^. workerId)
       liftIO $ cancel a
       nsWorkers . at sid .= Nothing
 
@@ -220,8 +223,8 @@ implementAssignments work stats = do
           Right _ -> return ()
           Left e -> liftIO $ do
             w' <- readMVar w
-            echo ("Worker died or was killed with error: "
-                  <> show e <> " - " <> show w')
+            echo ("Worker died with "
+                  <> show e <> ". " <> show w')
 
       nsWorkers . at sid .= Just (w, a)
 
@@ -251,7 +254,8 @@ runWorker stats s mw f = runResourceT $ do
       modifyMVar_ mw $ \ w -> evaluate $ w
         & workerLastBeat .~ now
 
-    streamRecords sid sn =$= go $$ C.sinkNull
+    c <- view configRecordBatch
+    streamRecords sid sn c =$= go $$ C.sinkNull
 
     liftIO $ f Nothing
 
@@ -260,12 +264,14 @@ runWorker stats s mw f = runResourceT $ do
     sn = s ^. shardSeq
 
     go = awaitForever $ \ record -> liftIO $ do
-      -- echo "Processing a record..."
-      f (Just record)
-      incStats stats "records" 1
-      modifyMVar_ mw $ \ w -> evaluate $ w
-        & workerLastProcessed .~ Just (recordSequenceNumber record)
-        & workerItems %~ (+1)
+      let ack = do
+              let !rseq = recordSequenceNumber record
+                  pickLatest !a = maybe (Just rseq) (Just . (max rseq)) a
+              modifyMVar_ mw $ \ w -> evaluate $ w
+                & workerLastProcessed %~ pickLatest
+                & workerItems %~ (+1)
+              incStats stats "records" 1
+      f (Just (record, ack))
 
 
 

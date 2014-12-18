@@ -54,16 +54,18 @@ streamRecords
     :: (Functor n, MonadIO n, MonadReader AppEnv n, MonadCatch n)
     => ShardId
     -> Maybe SequenceNumber
+    -> Maybe Int
     -> Producer (ResourceT n) Record
-streamRecords sid sn = do
+streamRecords sid sn lim = do
     nm <- either (error.toS) id <$> runEitherT getStream
     let pos = case sn of
           Nothing -> TrimHorizon
           Just _ -> AfterSequenceNumber
-    let gsi = GetShardIterator sid pos sn nm
+        gsi = GetShardIterator sid pos sn nm
     iter <- lift $ getShardIteratorResShardIterator <$> runKinesis 10 gsi
-    go (GetRecords Nothing iter)
+    go (GetRecords lim iter)
   where
+
     go r = do
       a <- lift $ runKinesis 10 r
       case nextIteratedRequest r a of

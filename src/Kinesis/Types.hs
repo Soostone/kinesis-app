@@ -68,13 +68,15 @@ mkNodeId = do
 
 -------------------------------------------------------------------------------
 data AppConfig = AppConfig {
-      _configLoopDelay  :: Int
+      _configLoopDelay   :: Int
       -- ^ How often we checkpoint node state (microseconds)
-    , _configGraceDelay :: NominalDiffTime
+    , _configGraceDelay  :: NominalDiffTime
     -- ^ How long before we start working on a new assignment
-    , _configNodeBeat   :: NominalDiffTime
+    , _configNodeBeat    :: NominalDiffTime
     -- ^ How long before we consider a node dead
-    , _configVerbose    :: Bool
+    , _configVerbose     :: Bool
+    , _configRecordBatch :: Maybe Int
+    -- ^ Limit for kinesis GetRecords request
     }
 
 
