@@ -15,9 +15,9 @@ library
   exposed-modules:     
     Kinesis.App
     Kinesis.Coordination
+    Kinesis.Kinesis
     Kinesis.Types
   other-modules:
-    Kinesis.Kinesis
     Kinesis.Redis
   other-extensions:    
     FlexibleContexts
