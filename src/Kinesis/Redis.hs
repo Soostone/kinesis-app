@@ -173,6 +173,7 @@ joinE m = do
     a <- m
     either (left . show) return a
 
+
 -------------------------------------------------------------------------------
 -- | Perform an action while acquiring configuration lock.
 lockingConfig
@@ -188,11 +189,17 @@ lockingConfig f = do
 
     lock
     res <- try f
-    unlock
+    case res of
+      Left _ -> unlock
+      Right _ -> unlock
     return res
 
 
 -------------------------------------------------------------------------------
+runRedis'
+    :: (Functor m, Show e, MonadIO m, MonadReader s m, HasAppEnv s)
+    => Redis (Either e b)
+    -> EitherT String m b
 runRedis' f = do
     r <- view appRedis
     showError . EitherT $ liftIO $ recoverAll redisPolicy $ runRedis r f
@@ -200,7 +207,7 @@ runRedis' f = do
 
 -------------------------------------------------------------------------------
 redisPolicy :: RetryPolicy
-redisPolicy = capDelay 10000000 $ exponentialBackoff 25000 <> limitRetries 10
+redisPolicy = capDelay 5000000 $ exponentialBackoff 25000 <> limitRetries 12
 
 
 showError :: (Functor m, Show e) => EitherT e m b -> EitherT String m b

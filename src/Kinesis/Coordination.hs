@@ -93,6 +93,8 @@ masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
 
     joinE $ lockingConfig introduceNode
 
+    liftIO $ async (updateNodeThread ae) >>= link
+
     let controlLoop = forever $ do
           joinE $ lockingConfig $ do
             balanceCluster
@@ -100,7 +102,6 @@ masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
             checkpointWorkers
             when (ae ^. aeAppConfig . configVerbose) $
               echo (show cs)
-            updateNode
           liftIO $ threadDelay delay
 
     controlLoop `catch`
@@ -149,19 +150,21 @@ mkNode = do
 
 
 -------------------------------------------------------------------------------
--- | Update node heartbeat.
-updateNode
-    :: (Functor m, MonadIO m, MonadReader AppEnv m)
-    => EitherT String m Bool
-updateNode = do
+-- | Periodically update node heartbeat
+updateNodeThread
+    :: AppEnv
+    => IO (Either String ())
+updateNodeThread ae = flip runReaderT ae . runEitherT . forever $ do
     nid <- view appNodeId
     n <- getNode nid
     now <- liftIO getCurrentTime
     setNode $ n & nodeLastBeat .~ now
+    liftIO $ threadDelay 5000000
 
 
 -------------------------------------------------------------------------------
--- | Remove dead workers from state so they are re-spawned
+-- | Remove dead workers from state so they are re-spawned. This is
+-- for workers that die/crash on their own.
 pruneDeadWorkers :: (MonadIO m, MonadState NodeState m) => m ()
 pruneDeadWorkers = do
     ws <- use $ nsWorkers . to M.toList
@@ -192,6 +195,8 @@ implementAssignments
 implementAssignments work stats = do
     echo "Implementing cluster assignments..."
 
+    pruneDeadWorkers
+
     nid <- view appNodeId
 
     cs@ClusterState{..} <- getClusterState
@@ -201,8 +206,6 @@ implementAssignments work stats = do
     let sids = map shardId states
 
     when (null states) $ echo $ "No shards have been assigned to this node..."
-
-    pruneDeadWorkers
 
     current <- use nsWorkers
 
@@ -217,6 +220,10 @@ implementAssignments work stats = do
 
         passedGrace s = diffUTCTime now (s ^. shardAssigned) > grace
 
+        -- We wait a while before activating a newly assigned worker.
+        -- If another node used to process this shard, we want to give
+        -- it enough time to gracefully cancel its assignment and sync
+        -- the latest shard state.
         news = filter (\s -> isNew s && passedGrace s) states
 
 
@@ -241,22 +248,46 @@ implementAssignments work stats = do
       let sid = shardId s
           curSeq = _shardSeq s
           curCount = _shardItems s
+
       w <- liftIO $ newMVar (Worker wid sid now curSeq curCount)
-
       a <- liftIO $ async (runReaderT (runWorker stats s w work) ae)
-      liftIO $ async $ do
-        res <- waitCatch a
-        case res of
-          Right _ -> return ()
-          Left e -> liftIO $ do
-            w' <- readMVar w
-            echo ("Worker died with "
-                  <> show e <> ". " <> show w')
-
+      watchWorkerTermination ae w a >>= liftIO . link
       nsWorkers . at sid .= Just (w, a)
 
-
     return cs
+
+
+-------------------------------------------------------------------------------
+-- | Watch a worker thread and make sure that we capture the latest
+-- shard state upon its death.
+watchWorkerTermination
+    :: MonadIO m
+    => AppEnv
+    -> MVar Worker
+    -> Async a
+    -> m (Async ())
+watchWorkerTermination ae mv a = liftIO $ async $ do
+    res <- waitCatch a
+    case res of
+      Right _ -> error "Unexpected: Worker finished working."
+      Left e -> liftIO $ do
+        w' <- readMVar mv
+        echo ("Worker died with " <> show e <> ". " <> show w' <> ". Syncing final shard state.")
+
+        -- synchronize worker's latest progress into the shard, so
+        -- that if another node picks this shard up, it will start
+        -- from the appropriate location.
+        --
+        -- TODO: This uses a config lock, but that will conflict with
+        -- the master loop's lock in cases where the worker is killed
+        -- by the master loop itself. Should be OK due to backoff, but
+        -- might cause problems in edge cases.
+        w <- liftIO (readMVar mv)
+        res' <- flip runReaderT ae $ runEitherT $
+          joinE $ lockingConfig $ syncShardState w
+        either error (const $ return ()) res'
+
+
 
 -------------------------------------------------------------------------------
 mkWorkerId :: MonadIO m => m WorkerId
@@ -412,7 +443,6 @@ balanceCluster = do
       echo $ "Deleting " <> show (length _clusterDeadNodes) <>
              " dead nodes: " <> show _clusterDeadNodes
       delNodes (map _nodeId _clusterDeadNodes)
-
 
 
     -- TODO remove shards that have been deleted
