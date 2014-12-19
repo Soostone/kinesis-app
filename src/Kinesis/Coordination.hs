@@ -5,6 +5,7 @@
 {-# LANGUAGE OverloadedStrings         #-}
 {-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE RecordWildCards           #-}
+{-# LANGUAGE ScopedTypeVariables       #-}
 
 module Kinesis.Coordination where
 
@@ -92,15 +93,20 @@ masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
 
     joinE $ lockingConfig introduceNode
 
-    forever $ do
-      joinE $ lockingConfig $ do
-        balanceCluster
-        cs <- implementAssignments f stats
-        checkpointWorkers
-        when (ae ^. aeAppConfig . configVerbose) $
-          echo (show cs)
-        updateNode
-      liftIO $ threadDelay delay
+    let controlLoop = forever $ do
+          joinE $ lockingConfig $ do
+            balanceCluster
+            cs <- implementAssignments f stats
+            checkpointWorkers
+            when (ae ^. aeAppConfig . configVerbose) $
+              echo (show cs)
+            updateNode
+          liftIO $ threadDelay delay
+
+    controlLoop `catch`
+      (\ (e :: SomeException) -> do
+           echo $ "Encountered uncaught exception in masterLoop: " <> show e
+           throwM e )
 
 
 -------------------------------------------------------------------------------
