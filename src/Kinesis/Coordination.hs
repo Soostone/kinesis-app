@@ -81,7 +81,7 @@ processorSink f run lim = do
 masterLoop
     :: (MonadIO m, MonadCatch m, MonadBaseControl IO m, MonadMask m)
     => AppEnv
-    -> Processor
+    -> IO Processor
     -> m (Either String ())
 masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
     liftIO $ hSetBuffering stdout LineBuffering
@@ -185,7 +185,8 @@ implementAssignments
     :: ( Functor m, MonadIO m, MonadReader AppEnv m, MonadBaseControl IO m
        , MonadCatch m
        , MonadState NodeState m )
-    => Processor
+    => IO Processor
+    -- ^ A processor maker
     -> Stats
     -> EitherT String m ClusterState
 implementAssignments work stats = do
@@ -268,9 +269,11 @@ runWorker
     => Stats
     -> ShardState
     -> MVar Worker
-    -> Processor
+    -> IO Processor
     -> m ()
-runWorker stats s mw f = runResourceT $ do
+runWorker stats s mw mkProcessor = runResourceT $ do
+    echo ("Initializing new worker for shard: " <> show s)
+
     mkNow <- liftIO $
       mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
 
@@ -281,7 +284,8 @@ runWorker stats s mw f = runResourceT $ do
         & workerLastBeat .~ now
 
     c <- view configRecordBatch
-    streamRecords sid sn c =$= go $$ C.sinkNull
+    f <- liftIO mkProcessor
+    streamRecords sid sn c =$= (go f) $$ C.sinkNull
 
     liftIO $ f Nothing
 
@@ -289,7 +293,7 @@ runWorker stats s mw f = runResourceT $ do
     sid = shardId s
     sn = s ^. shardSeq
 
-    go = awaitForever $ \ record -> liftIO $ do
+    go f = awaitForever $ \ record -> liftIO $ do
       let ack = do
               let !rseq = recordSequenceNumber record
                   pickLatest !a = maybe (Just rseq) (Just . (max rseq)) a
