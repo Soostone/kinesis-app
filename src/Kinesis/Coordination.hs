@@ -527,6 +527,3 @@ whenJust (Just a) f = f a
 whenJust Nothing _ = return ()
 
 
-echo :: MonadIO m => String -> m ()
-echo = liftIO . putStrLn
-

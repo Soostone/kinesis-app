@@ -110,24 +110,28 @@ runAws
 runAws servConf n r = do
     mgr <- view appManager
     conf <- view appAwsConfig
-    recovering (awsPolicy n) [kinesisH, httpRetryH, networkRetryH] $
+    recovering (awsPolicy n) [kinesisH echo, httpRetryH, networkRetryH] $
       hoist liftIO $
       pureAws conf servConf mgr r
 
 
 -------------------------------------------------------------------------------
-kinesisH :: MonadIO m => Int -> Handler m Bool
-kinesisH n = Handler $ \e -> do
-  let chk = case e of
-          KinesisErrorResponse cd _msg -> case cd of
+kinesisH
+    :: MonadIO m
+    => (String -> m ())
+    -- ^ How to report errors
+    -> Int
+    -> Handler m Bool
+kinesisH report n = handleLog chk report n
+  where
+    chk e = return $ case e of
+        KinesisErrorResponse cd _msg -> case cd of
             "ProvisionedThroughputExceededException" -> True
             _ -> False
-          KinesisOtherError stat _ -> case stat of
+        KinesisOtherError stat _ -> case stat of
             Status _ "Internal Server Error" -> True
             _ -> False
-          _ -> False
-  when chk $ retryMsg n e
-  return chk
+        _ -> False
 
 
 -------------------------------------------------------------------------------
@@ -140,12 +144,7 @@ awsPolicy n = capDelay 60000000 $
 -------------------------------------------------------------------------------
 -- | Which exceptions should we retry?
 httpRetryH :: MonadIO m => Int -> Handler m Bool
-httpRetryH n = Handler f
-    where
-      f e = do
-          let chk = httpRetry e
-          when chk $ retryMsg n e
-          return chk
+httpRetryH n = handleLog (return . httpRetry) echo n
 
 
 -------------------------------------------------------------------------------
@@ -170,15 +169,32 @@ httpRetry e =
 -------------------------------------------------------------------------------
 -- | 'IOException's should be retried
 networkRetryH :: MonadIO m => Int -> Handler m Bool
-networkRetryH n = Handler $ \ (e :: IOException) -> do
-    retryMsg n e
-    return True
+networkRetryH n = handleLog chk echo n
+    where
+      chk (_ :: IOException) = return True
 
 
 -------------------------------------------------------------------------------
-retryMsg :: (Show e, MonadIO m) => Int -> e -> m ()
-retryMsg n e = liftIO $ putStrLn $
-  "[retry:" <> show n <> "] Encountered " <> show e <> ". Retrying."
+-- | Handle exception while logging it.
+handleLog
+    :: (Monad m, Show e, Exception e)
+    => (e -> m Bool)
+    -- ^ Test for whether action is to be retried
+    -> (String -> m ())
+    -- ^ How ot report the generated warning message.
+    -> Int
+    -- ^ Retry number
+    -> Handler m Bool
+handleLog f report n = Handler $ \ e -> do
+    res <- f e
+    let msg = "[retry:" <> show n <> "] Encountered " <> show e <> ". " <>
+              if res then "Retrying." else "Crashing."
+    report msg
+    return res
 
+
+-------------------------------------------------------------------------------
+echo :: MonadIO m => String -> m ()
+echo = liftIO . putStrLn
 
 
