@@ -60,7 +60,7 @@ streamRecords
 streamRecords sid sn lim = do
     nm <- either (error.toS) id <$> runEitherT getStream
     let pos = case sn of
-          Nothing -> TrimHorizon
+          Nothing -> Latest
           Just _ -> AfterSequenceNumber
         gsi = GetShardIterator sid pos sn nm
     iter <- lift $ getShardIteratorResShardIterator <$> runKinesis 10 gsi
