@@ -187,7 +187,8 @@ lockingConfig f = do
     let lock = liftIO $ runRedis r $ blockLock redisPolicy "kinesis" 10 lk
         unlock = liftIO $ runRedis r $ releaseLock "kinesis" lk
 
-    lock
+    l <- lock
+    unless l $ error "lockingConfig could not acquire lock"
     res <- try f
     case res of
       Left _ -> unlock
