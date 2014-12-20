@@ -163,6 +163,7 @@ httpRetry e =
       ResponseBodyTooShort{} -> True
       InvalidChunkHeaders{} -> True
       IncompleteHeaders{} -> True
+      TlsException{} -> True
       _ -> False
 
 

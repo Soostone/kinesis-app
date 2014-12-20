@@ -4,10 +4,8 @@
 
 ### Immediate Needs
 
-- Add verbosity to config and disable majority of stdout messages
 - Needs an automated test suite
-- Need to test/debug multi-node operation
-- Need to test/debug shard splits and merges
+- Need to test/debug shard splits and merging
 
 ### Later Investigation
 - Add physical node awareness to balancing (for multiple processes per
