@@ -33,6 +33,7 @@ import           Network.HTTP.Conduit
 import           Network.HTTP.Types.Status
 -------------------------------------------------------------------------------
 import           Kinesis.Types
+import           Kinesis.Utils
 -------------------------------------------------------------------------------
 
 
@@ -68,13 +69,12 @@ streamRecords sid sn lim = do
 
     go r = do
       a <- lift $ runKinesis 10 r
-      case nextIteratedRequest r a of
-        Nothing -> return ()
-        Just r' -> do
-          case null (getRecordsResRecords a) of
-            True -> liftIO $ threadDelay 1000000
-            False -> C.sourceList (getRecordsResRecords a)
-          go r'
+      let rs = getRecordsResRecords a
+      unless (null rs) $ C.sourceList rs
+
+      whenJust (nextIteratedRequest r a) $ \ r' -> do
+        when (null rs) $ liftIO (threadDelay 1000000)
+        go r'
 
 
 -------------------------------------------------------------------------------

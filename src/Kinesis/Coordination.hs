@@ -85,11 +85,13 @@ masterLoop
     -> m (Either String ())
 masterLoop ae f = flip evalStateT def . flip runReaderT ae  . runEitherT $ do
     liftIO $ hSetBuffering stdout LineBuffering
+    echo $ "Booting new node for " <> show (ae ^. appName) <>
+           " processing stream " <> show (ae ^. appStream)
     delay <- view configLoopDelay <&> (*1000000)
 
     stats <- liftIO newStats
     liftIO $ addCounter stats "records"
-    liftIO . async $ reportStats stats 30
+    liftIO . async $ reportStatsForever stats 30
 
     joinE $ lockingConfig introduceNode
 

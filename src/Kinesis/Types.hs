@@ -58,6 +58,7 @@ data AppEnv = AppEnv {
     }
 
 
+
 -------------------------------------------------------------------------------
 mkNodeId :: IO NodeId
 mkNodeId = do
@@ -77,7 +78,7 @@ data AppConfig = AppConfig {
     , _configVerbose     :: Bool
     , _configRecordBatch :: Maybe Int
     -- ^ Limit for kinesis GetRecords request
-    }
+    } deriving (Show)
 
 
 -------------------------------------------------------------------------------
