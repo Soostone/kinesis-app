@@ -130,6 +130,7 @@ kinesisH report n = handleLog chk report n
             _ -> False
         KinesisOtherError stat _ -> case stat of
             Status _ "Internal Server Error" -> True
+            Status _ "Service Unavailable" -> True
             _ -> False
         _ -> False
 
